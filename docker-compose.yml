@@ -25,6 +25,20 @@ services:
       timeout: 3s
       retries: 10
 
+  # 热替换演练目标：默认不进 UPSTREAMS，值班员通过 replace API 将节点切到该实例
+  upstream3:
+    build:
+      context: ./upstream
+    environment:
+      NODE_ID: node3
+    ports:
+      - "18083:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   gateway:
     build:
       context: ./gateway

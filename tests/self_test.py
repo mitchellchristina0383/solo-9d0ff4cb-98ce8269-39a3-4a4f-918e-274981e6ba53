@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""网关本地自测（不依赖 docker，使用 stdlib + 三个 uvicorn 子进程）。
+"""网关本地自测（不依赖 docker，使用 stdlib + 四个 uvicorn 子进程）。
 
 覆盖关键场景：
   1.  轮询分发
@@ -15,6 +15,16 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求：排空须等全部结束，在途计数全程准确
+  15. 未知节点管理接口返回 404
+  热替换（16-22）：
+  16. 成功热替换：新 GET 走新址，状态含旧址与 offline_safe
+  17. 探测失败 / 非法 URL / 同址 / 未知节点：原地址与接流状态保留
+  18. 慢请求与替换交错：旧请求钉住旧址取原响应，未结清不可确认
+  19. 同节点并发替换只一轮生效（200 + 409）
+  20. 排空与替换交错：排空中新址不接流、503、旧址未结清 409
+  21. 超时未确认 -> offline_safe=false，排空回执如实反映，confirm 后放行
+  22. 旧址探测结论不覆盖新址（代际守卫 stale_probe_skips）
 """
 from __future__ import annotations
 
@@ -35,6 +45,7 @@ PYTHON = sys.executable
 GW_PORT = 19080
 U1_PORT = 19081
 U2_PORT = 19082
+U3_PORT = 19083
 
 passed = 0
 failed = 0
@@ -60,9 +71,49 @@ def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None
         return e.code, dict(e.headers), e.read().decode()
 
 
+def jpost(url: str, payload: dict, timeout: float = 20.0):
+    """POST JSON，返回 (status, body_dict)。4xx/5xx 不抛异常。"""
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url, data=data, method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
+def replace(node: str, new_url: str, timeout: float = 20.0):
+    return jpost(
+        f"http://127.0.0.1:{GW_PORT}/admin/nodes/{node}/replace",
+        {"new_url": new_url}, timeout=timeout,
+    )
+
+
+def jpost_url(url: str, timeout: float = 20.0):
+    """对完整 URL 发空体 POST（confirm 等无 body 接口），返回 (status, body_dict)。"""
+    req = urllib.request.Request(url, data=b"", method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read().decode())
+
+
 def jget(url: str, timeout: float = 20.0):
     status, _, body = http("GET", url, timeout)
     return status, json.loads(body)
+
+
+def hget(headers: dict, name: str):
+    """大小写不敏感的响应头读取（urllib 保留服务器发来的小写头名）。"""
+    lowered = name.lower()
+    for k, v in headers.items():
+        if k.lower() == lowered:
+            return v
+    return None
 
 
 def wait_ready(url: str, timeout: float = 25.0) -> bool:
@@ -123,12 +174,14 @@ def set_mode(port: int, mode: str) -> None:
 def main() -> int:
     procs = []
     try:
-        print("== 启动两个上游和网关 ==")
+        print("== 启动三个上游和网关 ==")
         u1 = spawn(os.path.join(ROOT, "upstream"), U1_PORT, {"NODE_ID": "node1"})
         u2 = spawn(os.path.join(ROOT, "upstream"), U2_PORT, {"NODE_ID": "node2"})
-        procs = [u1, u2]
+        u3 = spawn(os.path.join(ROOT, "upstream"), U3_PORT, {"NODE_ID": "node3"})
+        procs = [u1, u2, u3]
         assert wait_ready(f"http://127.0.0.1:{U1_PORT}/")
         assert wait_ready(f"http://127.0.0.1:{U2_PORT}/")
+        assert wait_ready(f"http://127.0.0.1:{U3_PORT}/")
 
         gw_env = {
             "UPSTREAMS": f"node1=http://127.0.0.1:{U1_PORT},node2=http://127.0.0.1:{U2_PORT}",
@@ -294,8 +347,10 @@ def main() -> int:
         check("/docs 返回 200", status == 200 and "swagger" in body.lower())
         status, body = jget(f"http://127.0.0.1:{GW_PORT}/openapi.json")
         paths = body["paths"]
-        check("openapi 含管理与转发接口",
-              "/admin/nodes/{name}/drain" in paths and "/proxy/{path}" in paths)
+        check("openapi 含管理、热替换与转发接口",
+              "/admin/nodes/{name}/drain" in paths
+              and "/admin/nodes/{name}/replace" in paths
+              and "/proxy/{path}" in paths)
 
         # 12. 排空等待超时：202 + 在途准确
         print("== 12. 排空超时返回 202 ==")
@@ -414,6 +469,262 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+
+        # ---- 热替换系列：先重启网关，回到干净状态 ----
+        kill(gw)
+        procs.remove(gw)
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        time.sleep(1.5)
+        assert node_status("node1")["eligible"] and node_status("node2")["eligible"]
+        u1_url = f"http://127.0.0.1:{U1_PORT}"
+        u2_url = f"http://127.0.0.1:{U2_PORT}"
+        u3_url = f"http://127.0.0.1:{U3_PORT}"
+
+        # 16. 成功热替换：新 GET 走新址，旧址记账可见
+        print("== 16. 成功热替换 ==")
+        # 先排空 node2，让验证流量全部落在 node1
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        assert status == 200
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        assert status == 200 and body["node"] == "node1"
+        status, rb = replace("node1", u3_url)
+        check("替换探测成功返回 200", status == 200 and rb.get("replaced") is True, str(rb))
+        check("回执含新旧地址与代际",
+              rb.get("previous_url") == u1_url and rb.get("base_url") == u3_url
+              and rb.get("generation") == 1 and rb.get("offline_safe") is True, str(rb))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("新请求转到新址 node3", status == 200 and body["node"] == "node3", body)
+        status, headers, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("响应头标注实际转发 URL", hget(headers, "X-Upstream-Url") == u3_url, str(headers))
+        st = node_status("node1")
+        check("状态 base_url 已更新为新址", st["base_url"] == u3_url, str(st))
+        check("状态含旧址块且可下线",
+              st["old_address"] is not None and st["old_address"]["url"] == u1_url
+              and st["old_address"]["offline_safe"] is True
+              and st["previous"]["inflight"] == 0 and st["offline_safe"] is True, str(st))
+        check("新址健康且节点未排空", st["healthy"] is True and st["draining"] is False, str(st))
+        # 结清并确认旧址，然后切回 u1，恢复场景
+        status, cb = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+        check("确认旧址返回 200", status == 200 and cb.get("confirmed") is True, str(cb))
+
+        # 17. 探测失败 / 非法输入：原地址与接流状态原样保留
+        print("== 17. 探测失败与非法输入 ==")
+        before = node_status("node1")
+        status, rb = replace("node1", "http://127.0.0.1:1/nope")  # 无监听 -> 连接失败
+        check("探测失败返回 502", status == 502 and rb.get("replaced") is False
+              and rb.get("probe_ok") is False, str(rb))
+        after = node_status("node1")
+        check("失败后原地址保留", after["base_url"] == u3_url == before["base_url"], str(after))
+        check("失败后接流状态保留", after["eligible"] == before["eligible"] is True, str(after))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("失败后流量仍走新址 node3", status == 200 and body["node"] == "node3", body)
+        status, rb = replace("node1", "ftp://bad-scheme")
+        check("非法 URL 返回 400", status == 400 and rb.get("error") == "invalid_url", str(rb))
+        status, rb = replace("node1", u3_url)
+        check("与当前地址相同返回 400", status == 400 and rb.get("error") == "same_as_current", str(rb))
+        status, rb = replace("ghost", u1_url)
+        check("替换未知节点返回 404", status == 404, str(rb))
+        st = node_status("node1")
+        check("各类拒绝均未改动状态", st["base_url"] == u3_url and st["generation"] == 1, str(st))
+
+        # 18. 慢请求与替换交错：旧请求钉住旧址，未结清不可确认
+        print("== 18. 慢请求与热替换交错 ==")
+        result18 = {}
+
+        def slow_call18():
+            result18["status"], result18["headers"], result18["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=3", timeout=20
+            )
+
+        t18 = threading.Thread(target=slow_call18)
+        t18.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.1)
+        check("慢请求已进入当前地址 (node3)", node_status("node1")["inflight"] == 1)
+        t0 = time.time()
+        status, rb = replace("node1", u1_url)
+        swap_elapsed = time.time() - t0
+        check("替换不等待在途、立即生效", status == 200 and swap_elapsed < 1.0
+              and rb.get("base_url") == u1_url, f"{swap_elapsed:.2f}s {rb}")
+        st = node_status("node1")
+        check("旧址 node3 在途=1，节点不可下线",
+              st["previous"]["url"] == u3_url and st["previous"]["inflight"] == 1
+              and st["offline_safe"] is False, str(st))
+        status, _, nbody = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("替换后新请求走新址 node1", status == 200
+              and json.loads(nbody).get("node") == "node1", nbody)
+        status, cb = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+        check("旧址有在途时确认被拒 409", status == 409
+              and cb.get("error") == "previous_still_inflight", str(cb))
+        # 旧址未结清时发起再一轮替换 -> 409，不覆盖 previous
+        status, rb = replace("node1", u2_url)
+        check("旧址未结清时新一轮替换 409", status == 409
+              and rb.get("error") == "previous_not_settled", str(rb))
+        t18.join(timeout=20)
+        check("在途慢请求未被截断，取回旧址完整 200",
+              result18.get("status") == 200
+              and json.loads(result18["body"]).get("node") == "node3"
+              and hget(result18["headers"], "X-Upstream-Url") == u3_url, str(result18))
+        time.sleep(0.3)
+        st = node_status("node1")
+        check("慢请求结束后旧址在途归零、可下线",
+              st["previous"]["inflight"] == 0 and st["offline_safe"] is True, str(st))
+        status, cb = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+        check("结清后确认成功", status == 200 and cb.get("offline_safe") is True, str(cb))
+
+        # 19. 同一节点并发替换只允许一轮生效
+        print("== 19. 并发替换串行化 ==")
+        outcomes = {}
+        # 用屏障让两个请求几乎同时进入网关，提高锁竞争命中率
+        barrier = threading.Barrier(2)
+
+        def do_replace(tag: str, url: str):
+            barrier.wait()
+            outcomes[tag] = replace("node1", url)
+
+        th_a = threading.Thread(target=do_replace, args=("a", u3_url))
+        th_b = threading.Thread(target=do_replace, args=("b", u2_url))
+        th_a.start()
+        th_b.start()
+        th_a.join(timeout=20)
+        th_b.join(timeout=20)
+        codes = sorted(s for s, _ in outcomes.values())
+        check("并发替换结果为 200 + 409", codes == [200, 409], str(outcomes))
+        loser = next(b for b in outcomes.values() if b[0] == 409)
+        check("失败方提示 replace_in_progress",
+              loser[1].get("error") == "replace_in_progress", str(loser))
+        winner_url = outcomes["a"][1].get("base_url") if outcomes["a"][0] == 200 \
+            else outcomes["b"][1].get("base_url")
+        st = node_status("node1")
+        check("只有一轮替换生效，状态与胜方一致", st["base_url"] == winner_url
+              and st["generation"] == 3, str(st))
+        # 把节点切回 u1 并确认旧址，供后续场景使用
+        if st["base_url"] != u1_url:
+            status, _ = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+            assert status == 200
+            status, rb = replace("node1", u1_url)
+            assert status == 200, str(rb)
+        status, _ = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+        assert status == 200
+
+        # 20. 排空与替换交错：排空中新址不接流、503、回执含旧址
+        print("== 20. 排空与热替换交错 ==")
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+        assert status == 200
+        time.sleep(1.5)
+        status, rb = replace("node2", u3_url)
+        check("排空场景准备：node2 切到新址", status == 200 and rb["base_url"] == u3_url, str(rb))
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        assert status == 200
+        st = node_status("node2")
+        check("排空后新址同样不接流", st["draining"] is True and st["eligible"] is False, str(st))
+        # node1 仍可接流；再排空 node1 -> 全局 503
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5")
+        assert status == 200
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("全排空中（含替换后的新址）返回 503", status == 503, body)
+        # 排空中仍允许替换操作本身，但替换后节点依旧不接流
+        status, rb = replace("node2", u2_url)
+        check("排空中替换地址成功但节点仍不接流",
+              status == 200 and rb["base_url"] == u2_url and rb["eligible"] is False, str(rb))
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("替换不解除排空，仍 503", status == 503, body)
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        db = json.loads(body)
+        check("排空回执包含旧址块与 offline_safe",
+              status == 200 and db["drained"] is True and db["offline_safe"] is True
+              and db["old_address"] is not None and db["old_address"]["url"] == u3_url, body)
+        # 恢复两节点
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+        assert status == 200
+        time.sleep(1.5)
+
+        # 21. 超时未确认 -> offline_safe=false，排空回执如实，confirm 后放行
+        print("== 21. 旧址超时未确认与可下线判定 ==")
+        kill(gw)
+        procs.remove(gw)
+        short_env = dict(gw_env)
+        short_env["REQUEST_TIMEOUT"] = "1"
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, short_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.2)
+        assert node_status("node1")["eligible"]
+        set_mode(U1_PORT, "hang")
+        # 抢在周期探测前打一个必超时的请求（探测先摘除则重试，与场景 13 同策略）
+        status, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky", timeout=8)
+        if status != 504:
+            set_mode(U1_PORT, "healthy")
+            deadline = time.time() + 6
+            while time.time() < deadline and not node_status("node1")["eligible"]:
+                time.sleep(0.2)
+            set_mode(U1_PORT, "hang")
+            status, _, _ = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/flaky", timeout=8)
+        check("现地址请求返回 504", status == 504, f"status={status}")
+        set_mode(U1_PORT, "healthy")
+        # 把节点替换到健康的 u3：u1 成为带未确认超时的旧址
+        deadline = time.time() + 6
+        while time.time() < deadline:
+            status, rb = replace("node1", u3_url)
+            if status == 200:
+                break
+            time.sleep(0.5)
+        check("恢复后可替换到 u3", status == 200, str(rb))
+        st = node_status("node1")
+        check("旧址存在未确认超时，节点不可下线",
+              st["previous"]["unconfirmed_timeouts"] >= 1
+              and st["previous"]["offline_safe"] is False
+              and st["offline_safe"] is False, str(st))
+        check("新址健康可接流，未被旧址结论污染",
+              st["healthy"] is True and st["eligible"] is True, str(st))
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=3")
+        db = json.loads(body)
+        check("排空回执在未确认超时存在时不报告可下线",
+              status == 200 and db["drained"] is True and db["offline_safe"] is False
+              and db["old_address"]["unconfirmed_timeouts"] >= 1, body)
+        status, cb = jpost_url(f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/replace/confirm")
+        check("确认后清零并可下线", status == 200 and cb["offline_safe"] is True
+              and cb["old_address"]["unconfirmed_timeouts"] == 0, str(cb))
+        status, rb = replace("node1", u2_url)
+        check("确认放行后新一轮替换成功", status == 200 and rb["base_url"] == u2_url, str(rb))
+
+        # 22. 旧址探测结论不得覆盖新址（代际守卫）
+        print("== 22. 代际守卫：旧探测结论丢弃 ==")
+        kill(gw)
+        procs.remove(gw)
+        # 长探测超时 + 短间隔：保证挂在旧址上的探测必然跨越替换时刻
+        guard_env = dict(gw_env)
+        guard_env["PROBE_TIMEOUT"] = "4"
+        guard_env["PROBE_INTERVAL"] = "1"
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, guard_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        time.sleep(1.5)
+        assert node_status("node1")["eligible"]
+        # u1 置 hang：周期探测会挂在旧址上（4s 超时）
+        set_mode(U1_PORT, "hang")
+        time.sleep(2.0)  # 至少一轮周期探测已发出并挂在 u1 上
+        status, rb = replace("node1", u3_url)  # 替换探测打 u3（健康，立即返回）
+        check("hang 的旧址不影响新址替换", status == 200 and rb["base_url"] == u3_url, str(rb))
+        st = node_status("node1")
+        check("替换后新址立即健康可接流", st["healthy"] is True and st["eligible"] is True, str(st))
+        time.sleep(5.0)  # 等挂在旧址上、跨越替换时刻的探测超时返回
+        st = node_status("node1")
+        check("过期探测被代际守卫丢弃，新址保持健康",
+              st["current"]["healthy"] is True and st["eligible"] is True
+              and st["stale_probe_skips"] >= 1, str(st))
+        check("旧址状态冻结（未被后续探测改写）",
+              st["previous"]["url"] == u1_url and st["previous"]["healthy"] is True, str(st))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("流量稳定走新址 node3", status == 200 and body["node"] == "node3", body)
+        set_mode(U1_PORT, "healthy")
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0
